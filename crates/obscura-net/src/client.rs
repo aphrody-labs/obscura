@@ -607,17 +607,29 @@ pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 /// guard away for a better TLS fingerprint.
 pub struct SsrfGuardResolver {
     pub(crate) allow_private: bool,
+    honor_environment: bool,
 }
 
 impl SsrfGuardResolver {
     pub fn new(allow_private: bool) -> Self {
-        Self { allow_private }
+        Self {
+            allow_private,
+            honor_environment: true,
+        }
+    }
+
+    /// An embedder can require context-only permissions without inheriting a CLI opt-in.
+    pub fn with_environment_policy(allow_private: bool, honor_environment: bool) -> Self {
+        Self {
+            allow_private,
+            honor_environment,
+        }
     }
 }
 
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let allow = self.allow_private || env_allows_private_network();
+        let allow = self.allow_private || (self.honor_environment && env_allows_private_network());
         let host = name.as_str().to_string();
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
@@ -641,7 +653,16 @@ impl Resolve for SsrfGuardResolver {
 }
 
 pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
-    let allow_private_network = allow_private_network || env_allows_private_network();
+    validate_url_with_environment(url, allow_private_network, true)
+}
+
+fn validate_url_with_environment(
+    url: &Url,
+    allow_private_network: bool,
+    honor_environment: bool,
+) -> Result<(), ObscuraNetError> {
+    let allow_private_network =
+        allow_private_network || (honor_environment && env_allows_private_network());
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
@@ -850,6 +871,9 @@ pub struct ObscuraHttpClient {
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+    /// Native embedders set false before first use to enforce this context's permission only.
+    /// Legacy CLI behavior continues to honor OBSCURA_ALLOW_PRIVATE_NETWORK by default.
+    pub honor_private_network_environment: bool,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1061,6 +1085,22 @@ impl ObscuraHttpClient {
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
+            honor_private_network_environment: true,
+        }
+    }
+
+    fn validate_context_url(&self, url: &Url) -> Result<(), ObscuraNetError> {
+        if self.honor_private_network_environment {
+            validate_url(url, self.allow_private_network)
+        } else {
+            // File resources otherwise return before the HTTP interceptor below.
+            // Remote native contexts have no authority to read host resources.
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(ObscuraNetError::Blocked(
+                    "native contexts permit only HTTP(S) resources".into(),
+                ));
+            }
+            validate_url_with_environment(url, self.allow_private_network, false)
         }
     }
 
@@ -1071,8 +1111,16 @@ impl ObscuraHttpClient {
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
-                .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
-;
+                .dns_resolver(Arc::new(SsrfGuardResolver::with_environment_policy(
+                    self.allow_private_network,
+                    self.honor_private_network_environment,
+                )));
+            // An inherited proxy can resolve the target itself and bypass our DNS guard.
+            // Strict native contexts inherit neither private-network opt-ins nor proxy routing.
+            // An explicit configured proxy is still applied below for its owner.
+            if !self.honor_private_network_environment {
+                builder = builder.no_proxy();
+            }
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
@@ -1375,7 +1423,7 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, self.allow_private_network)?;
+        self.validate_context_url(url)?;
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
@@ -1608,7 +1656,7 @@ impl ObscuraHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, self.allow_private_network)?;
+                    self.validate_context_url(&next_url)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -1698,6 +1746,47 @@ pub enum ObscuraNetError {
 
 #[cfg(test)]
 mod ssrf_tests {
+    #[test]
+    fn strict_context_permissions_do_not_inherit_the_cli_environment() {
+        let mut client = super::ObscuraHttpClient::new();
+        assert!(client.honor_private_network_environment);
+        client.honor_private_network_environment = false;
+        let loopback = url::Url::parse("http://127.0.0.1/").unwrap();
+        assert!(client.validate_context_url(&loopback).is_err());
+        assert!(client.validate_context_url(&url::Url::parse("https://example.test/").unwrap()).is_ok());
+        client.allow_private_network = true;
+        assert!(client.validate_context_url(&loopback).is_ok());
+        let resolver = super::SsrfGuardResolver::with_environment_policy(false, false);
+        assert!(!resolver.allow_private);
+        assert!(!resolver.honor_environment);
+        assert!(super::SsrfGuardResolver::new(false).honor_environment);
+    }
+
+    #[tokio::test]
+    async fn strict_context_resources_cannot_take_the_local_file_shortcut() {
+        let mut client = ObscuraHttpClient::new();
+        client.honor_private_network_environment = false;
+        client.allow_private_network = true;
+        let file = Url::parse("file:///__yolo_nonexistent_browser_permission_fixture__").unwrap();
+        assert!(matches!(client.fetch(&file).await, Err(ObscuraNetError::Blocked(_))));
+        for value in ["data:text/plain,fixture", "ftp://example.test/"] {
+            assert!(matches!(
+                client.validate_context_url(&Url::parse(value).unwrap()),
+                Err(ObscuraNetError::Blocked(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_context_dns_does_not_resolve_loopback_without_permission() {
+        let resolver = SsrfGuardResolver::with_environment_policy(false, false);
+        let name = Name::from_str("127.0.0.1").unwrap();
+        assert!(Resolve::resolve(&resolver, name.clone()).await.is_err());
+        let allowed = SsrfGuardResolver::with_environment_policy(true, false);
+        let mut addresses = Resolve::resolve(&allowed, name).await.unwrap();
+        assert!(addresses.next().unwrap().ip().is_loopback());
+    }
+
     use super::{
         is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,

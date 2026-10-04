@@ -3176,6 +3176,33 @@ fn intercept_fulfill_response(
     })
 }
 
+/// Honor an embedder's immutable native request policy even when scripted fetch/XHR
+/// uses request_client() directly. Every preflight and redirect is checked before I/O.
+/// Existing fulfill/header-rewrite actions keep their navigation behavior; this gate
+/// only carries the native blocking decision into the scripted transport.
+async fn enforce_context_request_policy(
+    client: &Option<Arc<ObscuraHttpClient>>,
+    raw_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+) -> Result<(), deno_error::JsErrorBox> {
+    let Some(client) = client else { return Ok(()) };
+    let policy = client.interceptor.read().await;
+    let Some(policy) = policy.as_ref() else { return Ok(()) };
+    let url = url::Url::parse(raw_url)
+        .map_err(|_| deno_error::JsErrorBox::generic("native request policy rejected an invalid URL"))?;
+    let request = RequestInfo {
+        url,
+        method: method.to_string(),
+        headers: headers.clone(),
+        resource_type: ResourceType::Fetch,
+    };
+    if matches!(policy.intercept(&request).await, obscura_net::interceptor::InterceptAction::Block) {
+        return Err(deno_error::JsErrorBox::generic("native context request policy denied this origin"));
+    }
+    Ok(())
+}
+
 #[op2]
 #[string]
 async fn op_fetch_url(
@@ -3276,6 +3303,10 @@ async fn op_fetch_url(
         })
         .to_string());
     }
+    enforce_context_request_policy(
+        &http_client, &url, &method,
+        &serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default(),
+    ).await?;
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
     let credentials = FetchCredentials::parse(&credentials);
@@ -3455,6 +3486,7 @@ async fn op_fetch_url(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
+        enforce_context_request_policy(&http_client, &url, "OPTIONS", &custom_headers).await?;
         let mut preflight_request = client
             .request(reqwest::Method::OPTIONS, &url)
             .timeout(fetch_timeout())
@@ -3555,6 +3587,7 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                http_client.clone(),
             )
             .await;
         }
@@ -3575,6 +3608,7 @@ async fn op_fetch_url(
     let mut crossed_origin = is_cross_origin;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
     let response = loop {
+        enforce_context_request_policy(&http_client, &current_url, current_method.as_str(), &current_headers).await?;
         let mut req = client
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
@@ -3879,6 +3913,7 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
+    http_client: Option<Arc<ObscuraHttpClient>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -3894,6 +3929,7 @@ async fn stealth_fetch_all(
     let cookie_initiator = url::Url::parse(&page_origin).ok();
 
     let response = loop {
+        enforce_context_request_policy(&http_client, &current_url, &current_method, &current_headers).await?;
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -4104,6 +4140,42 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    struct FixtureOriginPolicy;
+    impl obscura_net::interceptor::RequestInterceptor for FixtureOriginPolicy {
+        fn intercept<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            request: &'life1 obscura_net::RequestInfo,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = obscura_net::interceptor::InterceptAction> + Send + 'async_trait>>
+        where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait {
+            let allowed = request.url.origin().ascii_serialization() == "https://allowed.test";
+            Box::pin(async move {
+                if allowed { obscura_net::interceptor::InterceptAction::Continue }
+                else { obscura_net::interceptor::InterceptAction::Block }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_transport_honors_context_policy_for_preflight_and_redirect_targets() {
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::new());
+        *client.interceptor.write().await = Some(Box::new(FixtureOriginPolicy));
+        let client = Some(client);
+        let headers = std::collections::HashMap::new();
+        assert!(super::enforce_context_request_policy(&client, "https://allowed.test/path", "GET", &headers).await.is_ok());
+        for method in ["GET", "OPTIONS", "POST"] {
+            assert!(super::enforce_context_request_policy(&client, "https://denied.test/path", method, &headers).await.is_err());
+        }
+        assert!(super::enforce_context_request_policy(&client, "not-a-url", "GET", &headers).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_transport_keeps_default_behavior_without_a_context_policy() {
+        let client = Some(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        let headers = std::collections::HashMap::new();
+        assert!(super::enforce_context_request_policy(&client, "https://elsewhere.test", "GET", &headers).await.is_ok());
+        assert!(super::enforce_context_request_policy(&None, "https://elsewhere.test", "GET", &headers).await.is_ok());
+    }
+
     use super::{
         FetchCredentials, ObscuraState, cors_response_allows, cors_unsafe_request_header_names,
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
