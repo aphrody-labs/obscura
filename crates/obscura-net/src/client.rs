@@ -1783,10 +1783,11 @@ mod ssrf_tests {
     #[tokio::test]
     async fn strict_context_dns_does_not_resolve_loopback_without_permission() {
         let resolver = SsrfGuardResolver::with_environment_policy(false, false);
-        let name = Name::from_str("127.0.0.1").unwrap();
-        assert!(Resolve::resolve(&resolver, name.clone()).await.is_err());
+        // reqwest::dns::Name is not Clone: build one per resolution.
+        let loopback = || Name::from_str("127.0.0.1").unwrap();
+        assert!(Resolve::resolve(&resolver, loopback()).await.is_err());
         let allowed = SsrfGuardResolver::with_environment_policy(true, false);
-        let mut addresses = Resolve::resolve(&allowed, name).await.unwrap();
+        let mut addresses = Resolve::resolve(&allowed, loopback()).await.unwrap();
         assert!(addresses.next().unwrap().ip().is_loopback());
     }
 
